@@ -1,23 +1,38 @@
-# 数据来源
+# 数据来源与致谢
 
-模块运行时从当前客户端的 Relic、RelicNote、MonsterNoteTarget、ContentFinderCondition、Leve、Level 等游戏表读取名称、ID、要求和地点。
+本仓库只发布本模块源码与编译产物，不重新分发下列第三方插件或库。相关项目的代码、数据与名称归其各自权利人所有，适用各项目自身的许可及使用条件。
 
-怪物候选出生点使用 Omni 自带 LuminaSupplemental.Excel 的 MobSpawn 资源，经公开 API 读取，未将该库或其源代码打包进模块。项目：https://github.com/Critical-Impact/LuminaSupplemental 。数据存在占位坐标和缺失情况，因此运行时还会检查区域、可达性和目标实际加载状态。
+## 客户端与运行时数据
 
-《火天文书》第一卷的 10 个备用世界坐标参考公开的 ZodiacWeapons/Skyfire I 敌人配置中的地点事实。原配置标注作者 Zamphire，Code Credit: nishap；这里只记录地图位置，没有使用 RebornBuddy 实现或行为代码。来源：https://github.com/Angles24/ZodiacWeapons/blob/master/Animus/Skyfire%20I/Skyfire%20I%20-%20Enemies.xml 。备用位置仍须通过当前 vnavmesh 投影检查。
+书名、古武、职业、怪物、任务类型、地点、动作、交互对象及进度，来自当前客户端的Relic、RelicNote、MonsterNoteTarget、Item、ClassJobCategory、Fate、Leve、Level、BNpcName、EObj、Emote、TextCommand等游戏表及原生状态。
 
-客户端结构参考：https://github.com/aers/FFXIVClientStructs 。寻路和副本通过原插件公开 IPC 调用，不包含其程序实现。
+- [FFXIVClientStructs](https://github.com/aers/FFXIVClientStructs)：客户端结构、方法签名及公开字段参考。
+- [LuminaSupplemental](https://github.com/Critical-Impact/LuminaSupplemental)：通过Omni提供的公开API读取MobSpawn资源。没有把该库或其源代码打包进模块。位置数据可能缺失或不精确，运行时仍需检查区域和可达性。
 
-第一卷 FATE 的三个等待位置和 610→611 的前置关系参考同仓库 Skyfire I - Fates.xml 中的地点事实（作者 Zamphire，标注 nishap）。活动 480、589、610、611 的名称、等级和目标类型另与运行中客户端 Fate 表核对。只使用坐标和活动关联，不复制配置行为或执行代码。实际活动位置、范围、状态和进度以当前区域 FateManager 为准。
+## 宿主与集成
 
-ZodiacBuddyReborn 作为概念和数据关联的研究参考保存在 references 中，未将其程序或源代码复制到模块构建。
+- [OmniToolbox.TreePublic](https://github.com/YouShux/OmniToolbox.TreePublic)
+- [OmniToolbox.Common](https://github.com/YouShux/OmniToolbox.Common)
+- [OmniToolbox.TreeHouseOnline](https://github.com/YouShux/OmniToolbox.TreeHouseOnline)
+- [vnavmesh](https://github.com/awgil/ffxiv_navmesh)：通过IPC使用导航查询与路径执行。
+- [BossMod Reborn](https://github.com/FFXIV-CombatReborn/BossModReborn)：通过IPC与经过形状检查的内部接口使用预设及自动移动；不包含其实现。
+- AutoDuty：使用本机安装版本的公开IPC执行已有副本路线，不包含其程序、路线文件或依赖库。
 
-## 第一卷理符交互数据
+## 地点事实与任务关联研究
 
-索敌理符 849 的“戳指”、流光水晶和伪装目标规则来自运行中客户端 Leve 描述、Emote、EventItem 和 BNpcName 表：Emote 28；EventItem 2000558；徘徊妖火 491、追猎蜻蜓飞蜥 1638、鲜血短尾雕 1789、浮尘小恶魔 1788。低版本公开路线只用于比对事实，不复制其执行实现。
+[Angles24/ZodiacWeapons](https://github.com/Angles24/ZodiacWeapons)中的公开配置用于参考地点、目标编号、前置活动等事实，未复制其行为执行代码。
 
-军队类别按客户端 LeveAssignmentType 表读取；第三项 868 为双蛇党。地点由 Level 表读取，额外投影到当前导航网格地面，修正表内高度与可走地面不一致。
+- Skyfire I / II敌人配置：第一、二卷备用位置；作者Zamphire，标注Code Credit nishap。
+- Skyfire I / II、Netherfire I、Skyfall I / II FATE配置：目标ID及610→611、570→571、568→569等前置关联；作者Zamphire，标注nishap。活动信息另与当前客户端数据核对。
+- Camp Bluefog/Circling the Ceruleum：646巡逻位置与2001104交互对象。
+- Whitebrim/Necrologos Whispers of the Gem：649场地搜索位置与目标关联。
+- Whitebrim/The Area’s a Bit Sketchy：652巡逻位置与对象。
+- Camp Bluefog/Someone’s in the Doghouse：647与警犬关联的研究参考。该旧配置本身未完成引导流程，未采用其被注释的执行方案；本模块的分段导航、定向招手与保护逻辑单独实现。
 
-第二卷的十个备用怪物位置取自同仓库 Animus/Skyfire II/Skyfire II - Enemies.xml 地点事实，仍标注作者Zamphire/nishap；571前置570的关联用Skyfire II - Fates.xml作事实对照。忘忧泪2000872、巴罗尔之铃1738、恶神之眼1739另与客户端EventItem/BNpcName表核对。换书NPC通过运行中对象表核对BaseId1006976、摩杜纳坐标(71.95,33.07,-706.29)；不复制外部插件执行代码。
+相关GuildLeves原配置署名Zamphire，部分文件列出的Code Credit包括TuckMeIntoBread、Kayla、Sodimm、y2krazy、Ken_512；具体以各原文件署名为准。
 
-第三卷巡逻理符646的三个搜索坐标与交互对象2001104，参考ZodiacWeapons/GuildLeves/Camp Bluefog/Circling the Ceruleum.xml中的地点与对象事实；原文件署名Zamphire，Code Credit TuckMeIntoBread/Kayla/Sodimm/y2krazy/Ken_512。仅提取事实，未复制其执行代码。646、860、863的名称、类型及地点已与运行中客户端Leve表核对；2001104另核对EObj表。新增第三卷理符执行仍待实测。
+ZodiacBuddyReborn曾作为概念与数据关联的研究参考，未将其源码或程序纳入本模块构建或发布包。
+
+## 本项目声明
+
+本模块使用的直接游戏表数据、坐标及任务关联不构成对第三方代码的许可声明。作者仅就拥有权利的本模块内容作出LICENSE中的使用范围说明；第三方权利不因本仓库发布而改变。

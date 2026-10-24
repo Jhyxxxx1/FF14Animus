@@ -1,0 +1,17 @@
+artifacts/
+dist/
+bin/
+obj/
+.tools/
+references/
+diagnostics/
+*.tmp
+*.user
+*.log
+*.pdb
+*.zip
+*.books.*.json
+*.settings.json
+.vs/
+.idea/
+!downloads/*.zip

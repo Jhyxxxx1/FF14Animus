@@ -19,6 +19,7 @@ using FFXIVClientStructs.FFXIV.Common.Component.BGCollision;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using NativeGameObject = FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject;
 using OmenTools.Extensions;
@@ -40,13 +41,14 @@ namespace OmniToolbox.TreePublic;
 // Explicitly started execution only; progress is always read back from the game.
 public sealed unsafe class AnimusBookAssistant : ModuleBase
 {
+    private const string ReleaseVersion = "0.1.0-preview.1";
     public override ModuleInfo Info { get; } = new()
     {
         Title = "古武小黄书助手",
         Description = "读取古武书本进度，自动赶路、战斗与副本执行；支持连续任务及完成后换书。适配范围见使用说明。",
         Category = ModuleCategory.Automation,
-        Author = "Local",
-        SupportUrls = [],
+        Author = "Jhyxxxx1",
+        SupportUrls = ["https://github.com/Jhyxxxx1/FF14Animus"],
         Commands = [new("打开小黄书助手", "/animusbook open")]
     };
 
@@ -59,7 +61,6 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private string bookName = "未映射";
     private string leveDebug = "";
     private uint lastRangeOrLos;
-    private uint lastActionStatus;
     private int teleportRetries;
     private IDutyState dutyState;
     private long dutyCompletedAt;
@@ -112,6 +113,21 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private bool enteredDuty;
     private bool dutyWasBusy;
     private string queuedAction;
+    private bool preparingEquipment;
+    private bool weaponEquipRequested;
+    private long equipmentRequestedAt;
+    private long equipmentStableAt;
+    private uint equipmentJob, equipmentWeapon;
+    private byte equipmentBook, equipmentRelic;
+    private ulong equipmentCharacter;
+    private string equipmentStatus = "";
+    private ulong historyCharacter;
+    private Dictionary<string, BookHistoryEntry> bookHistory = new();
+    private bool historyWritable, historyDirty;
+    private long historyRetryAt;
+    private string historyStatus = "";
+    private long deathPausedAt;
+    private bool equipmentContextPending;
     private readonly uint[] dungeonTerritories = new uint[3];
     private readonly string[] dungeonNames = new string[3];
     private readonly uint[] monsterNameIds = new uint[10];
@@ -143,6 +159,8 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private byte labelsForRelic;
     private bool labelsReady;
     private AnimusBookAssistantConfig config = new();
+    private string settingsStatus = "";
+    private bool settingsWritable = true;
     private bool pathFlying;
     private bool awaitingMount;
     private long mountRequestedAt;
@@ -154,6 +172,18 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private long patrolArrivedAt;
     private static readonly Vector3[] Patrol646Points =
     [new(-7.641754f, 3.0246f, 359.4961f), new(30.55565f, 6.980818f, 324.5174f), new(14.06814f, 6.060303f, 273.8956f)];
+    private static readonly Vector3[] Search649Points =
+    [new(-522.1238f, 206.3355f, -331.3058f), new(-607.6644f, 204.2211f, -412.5702f)];
+    private static readonly Vector3[] Patrol652Points = [new(-412.2287f, 223.9546f, -157.087f)];
+    private long dogBeckonAt;
+    private bool dogGuideInitialized;
+    private int dogGuidePhase;
+    private long dogPhaseAt;
+    private Vector3 dogStepStart;
+    private Vector3 dogLastBeckonPosition;
+    private int dogNoFollowAttempts;
+    private bool dogProtecting;
+    private int dogRetryAttempts;
     private long flightFallbackUntil;
     private bool landing;
     private long landingAt;
@@ -210,13 +240,14 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private readonly List<Vector3> failedLandingPoints = new();
     private Vector3 landingDestination;
     private (uint Territory, Vector3 Point) FateWaitPoint(int slot) => (fateTerritories[slot], default);
-    private ushort FatePrecursor(int slot) => fateIds[slot] switch { 611 => 610, 571 => 570, _ => 0 };
+    private ushort FatePrecursor(int slot) => fateIds[slot] switch { 611 => 610, 571 => 570, 569 => 568, _ => 0 };
     private sealed record RoutePoint(uint Territory, Vector3 Probe, int Slot);
 
     public override bool HasSettings => true;
 
     protected override void OnEnable()
     {
+        LoadSettings();
         TraceLifecycle("enable.begin");
         objectTable = GetService<IObjectTable>();
         clientState = GetService<IClientState>();
@@ -236,7 +267,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             if (!DalamudServices.CommandManager.Commands.ContainsKey(Command))
             {
                 DalamudServices.CommandManager.AddHandler(Command, new CommandInfo((_, args) => HandleAction(args))
-                { HelpMessage = "小黄书：open / nearby / monsters / dungeon / dungeons / leve / leves / stop / status / diagnose" });
+                { HelpMessage = "小黄书：open 打开界面 / auto 连续执行 / stop 停止 / status 状态 / diagnose 检查依赖" });
                 hasSlash = true;
             }
             TraceLifecycle("enable.ready");
@@ -299,7 +330,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 
     protected override bool OnInterruptAutomation()
     {
-        if (mode == RunMode.Idle) return false;
+        if (mode == RunMode.Idle && !preparingEquipment && !autoBooks) return false;
         queuedAction = "stop";
         return true;
     }
@@ -318,7 +349,39 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         DalamudServices.PluginInterface.GetService(typeof(T)) as T
         ?? throw new InvalidOperationException($"缺少服务 {typeof(T).Name}");
 
+    private string SettingsPath() => System.IO.Path.Combine(DalamudServices.PluginInterface.GetPluginConfigDirectory(), "AnimusBookAssistant.settings.json");
+
+    private void LoadSettings()
+    {
+        settingsWritable = true;
+        try
+        {
+            if (System.IO.File.Exists(SettingsPath()))
+                config = JsonSerializer.Deserialize<AnimusBookAssistantConfig>(System.IO.File.ReadAllText(SettingsPath())) ?? new();
+        }
+        catch (Exception ex) { settingsWritable = false; settingsStatus = $"设置读取失败，使用默认值且不覆盖原文件：{ex.Message}"; }
+    }
+
+    private void SaveSettings()
+    {
+        if (!settingsWritable) return;
+        try
+        {
+            var path = SettingsPath();
+            System.IO.File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(config));
+            System.IO.File.Move(path + ".tmp", path, true);
+            settingsStatus = "";
+        }
+        catch (Exception ex) { settingsStatus = $"设置保存失败，本次更改仅在当前加载期间生效：{ex.Message}"; }
+    }
+
     public override bool DrawSettings()
+    {
+        DrawContent();
+        return false;
+    }
+
+    private void DrawTravelSettings()
     {
         var changed = false;
         if (ImGui.CollapsingHeader("赶路设置"))
@@ -327,10 +390,9 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             if (ImGui.Checkbox("长途优先使用坐骑", ref mount)) { config.UseMount = mount; changed = true; }
             var flight = config.UseFlight;
             if (ImGui.Checkbox("可飞行时优先飞行", ref flight)) { config.UseFlight = flight; changed = true; }
-            ImGui.TextDisabled("无法起飞或通行受阻时自动回退地面路线。");
+            ImGui.TextWrapped("无法起飞或通行受阻时自动回退地面路线。");
         }
-        DrawContent();
-        return changed;
+        if (changed) SaveSettings();
     }
 
     private void Update(IFramework framework)
@@ -390,6 +452,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                 fates[i] = note->IsFateComplete(i);
                 leves[i] = note->IsLeveComplete(i);
             }
+            ObserveBookHistory();
 
             targets.Clear();
             foreach (var obj in objectTable)
@@ -402,9 +465,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             targets.Sort((left, right) => left.Distance.CompareTo(right.Distance));
             lastRead = DateTime.Now;
             readingFinished = true;
-            status = bookId == 1
-                ? "读取成功；第 1 本的书本 ID 和怪物槽位已通过 MCP 对照游戏窗口核对。其余完成位仍待验证。"
-                : "读取成功；当前书本映射尚需与游戏内核对";
+            status = bookId is >= 1 and <= 9 ? "书本进度已同步" : "当前没有有效的小黄书";
             if (queuedAction != null)
             {
                 var action = queuedAction;
@@ -413,7 +474,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                 else if (action == "diagnose") Diagnose();
                 else if (action == "auto")
                 {
-                    if (mode == RunMode.Idle) { autoBooks = true; autoNextAt = 0; autoStatus = "准备连续执行当前及后续书本"; }
+                    if (mode == RunMode.Idle && !preparingEquipment) PrepareAutoEquipment();
                 }
                 else
                 {
@@ -423,6 +484,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                         : action == "fates" ? RunMode.Fates : action is "leve" or "leves" ? RunMode.Leves : RunMode.Dungeons);
                 }
             }
+            DriveEquipmentPreparation();
             DriveRun();
             DriveAutoBooks();
         }
@@ -515,12 +577,135 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         labelsReady = true;
     }
 
+    private uint RequiredClassJob()
+    {
+        if (!LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Item>(requiredWeapon, out var item)) return 0;
+        var c = item.ClassJobCategory.Value;
+        return c.PLD ? 19u : c.MNK ? 20u : c.WAR ? 21u : c.DRG ? 22u : c.BRD ? 23u
+            : c.WHM ? 24u : c.BLM ? 25u : c.SMN ? 27u : c.SCH ? 28u : c.NIN ? 30u : 0u;
+    }
+
+    private void PrepareAutoEquipment()
+    {
+        autoBooks = false;
+        var job = RequiredClassJob();
+        var player = objectTable.LocalPlayer;
+        if (player == null || bookId == 0 || requiredWeapon == 0 || job == 0)
+        { executionStatus = "无法识别当前书本对应的职业和古武"; return; }
+        if (HasRequiredWeapon() && player.ClassJob.RowId == job)
+        { autoBooks = true; autoNextAt = 0; equipmentStatus = "对应职业与古武已装备"; return; }
+        if (condition[ConditionFlag.InCombat] || condition[ConditionFlag.BoundByDuty] || condition[ConditionFlag.Casting]
+            || condition[ConditionFlag.BetweenAreas] || condition[ConditionFlag.Mounted] || condition[ConditionFlag.Diving]
+            || condition[ConditionFlag.Gathering] || condition[ConditionFlag.Crafting] || player.CurrentHp == 0
+            || condition[ConditionFlag.OccupiedInEvent] || condition[ConditionFlag.OccupiedInQuestEvent] || condition[ConditionFlag.WatchingCutscene])
+        { executionStatus = "当前状态无法换装，请在副本外脱战、下坐骑并结束施法或交互后开始"; return; }
+        var inventory = InventoryManager.Instance();
+        if (inventory == null || inventory->GetInventoryItemCount(requiredWeapon, false, true, true) == 0)
+        { executionStatus = $"未找到对应古武（物品 ID {requiredWeapon}），请放入背包或兵装库"; return; }
+        var sets = RaptureGearsetModule.Instance();
+        if (sets == null) { executionStatus = "装备套装服务尚未就绪"; return; }
+        var chosen = -1;
+        for (var i = 0; player.ClassJob.RowId != job && i < 100; i++)
+        {
+            if (!sets->IsValidGearset(i)) continue;
+            var entry = sets->GetGearset(i);
+            if (entry == null || (entry->Flags & RaptureGearsetModule.GearsetFlag.Exists) == 0 || entry->ClassJob != job) continue;
+            if (chosen < 0 || i == sets->CurrentGearsetIndex) chosen = i;
+            if (i == sets->CurrentGearsetIndex) break;
+        }
+        if (chosen < 0 && player.ClassJob.RowId != job)
+        { executionStatus = "没有对应职业的普通装备套装，请先保存该职业套装；不需要在套装中保存古武"; return; }
+        equipmentJob = job; equipmentWeapon = requiredWeapon;
+        equipmentBook = bookId; equipmentRelic = relicId;
+        equipmentCharacter = DalamudServices.PlayerState.ContentId;
+        equipmentRequestedAt = Environment.TickCount64;
+        equipmentStableAt = 0;
+        weaponEquipRequested = false; equipmentContextPending = false;
+        equipmentStatus = executionStatus = chosen < 0 ? "职业已匹配，准备单独装备古武…" : $"正在切换对应职业（套装 {chosen + 1}），随后单独装备古武…";
+        preparingEquipment = true;
+        if (chosen >= 0 && sets->EquipGearset(chosen) != 0)
+        { preparingEquipment = false; equipmentStatus = executionStatus = "游戏拒绝切换装备套装，请检查装备缺失或换装限制"; }
+    }
+
+    private void DriveEquipmentPreparation()
+    {
+        if (!preparingEquipment) return;
+        var now = Environment.TickCount64;
+        if (condition[ConditionFlag.Unconscious] || objectTable.LocalPlayer?.CurrentHp == 0)
+        { equipmentRequestedAt = now; equipmentStatus = executionStatus = "等待复活，复活后继续换装"; return; }
+        if (DalamudServices.PlayerState.ContentId != equipmentCharacter || bookId != equipmentBook || relicId != equipmentRelic
+            || requiredWeapon != equipmentWeapon || condition[ConditionFlag.InCombat] || condition[ConditionFlag.BoundByDuty])
+        { StopRun("换装期间角色、书本或战斗状态变化，已停止"); return; }
+        if (now - equipmentRequestedAt < 1500) return;
+        if (objectTable.LocalPlayer?.ClassJob.RowId == equipmentJob && HasRequiredWeapon())
+        {
+            if (equipmentStableAt == 0) equipmentStableAt = now;
+            if (now - equipmentStableAt < 3000) return;
+            preparingEquipment = false;
+            equipmentStatus = "职业与古武核对成功";
+            executionStatus = equipmentStatus;
+            autoBooks = true; autoNextAt = now + 500;
+            return;
+        }
+        equipmentStableAt = 0;
+        if (equipmentContextPending)
+        {
+            var context = AgentInventoryContext.Instance();
+            var menu = (AddonContextMenu*)FindAddon("ContextMenu");
+            if (context != null && menu != null)
+            {
+                var count = Math.Clamp(context->ContextItemCount, 0, 32);
+                var start = context->ContexItemStartIndex;
+                for (var i = 0; i < count && start >= 0 && start + i < 98; i++)
+                {
+                    var value = context->EventParams[start + i];
+                    if (value.Type is not (FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.String or FFXIVClientStructs.FFXIV.Component.GUI.AtkValueType.ManagedString)) continue;
+                    if (value.String.ToString() != "装备" || context->IsContextItemDisabled(i)) continue;
+                    equipmentContextPending = false;
+                    menu->OnMenuSelected(i, 0);
+                    return;
+                }
+            }
+            if (now - equipmentRequestedAt > 10000) StopRun("未找到可用的装备菜单项，已停止");
+            return;
+        }
+        if (objectTable.LocalPlayer?.ClassJob.RowId == equipmentJob && !weaponEquipRequested)
+        {
+            var inventory = InventoryManager.Instance();
+            if (inventory == null || !LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Item>(equipmentWeapon, out var weapon))
+            { StopRun("无法读取古武或背包数据，已停止"); return; }
+            foreach (var type in new[] { InventoryType.ArmoryMainHand, InventoryType.ArmoryOffHand,
+                InventoryType.Inventory1, InventoryType.Inventory2, InventoryType.Inventory3, InventoryType.Inventory4 })
+            {
+                var container = inventory->GetInventoryContainer(type);
+                if (container == null || !container->IsLoaded) continue;
+                for (var slot = 0; slot < Math.Clamp(container->Size, 0, 200); slot++)
+                {
+                    var item = container->GetInventorySlot(slot);
+                    if (item == null || item->ItemId != equipmentWeapon) continue;
+                    weaponEquipRequested = true;
+                    equipmentRequestedAt = now;
+                    equipmentStatus = executionStatus = "职业切换完成，正在单独装备对应古武…";
+                    // Use the same equipment operation as the inventory context menu.
+                    var context = AgentInventoryContext.Instance();
+                    if (context == null) { StopRun("装备菜单服务不可用"); return; }
+                    equipmentContextPending = true;
+                    context->OpenForItemSlot(type, slot, 0, 0);
+                    return;
+                }
+            }
+            StopRun("对应古武不在已加载的背包或兵装库中，已停止");
+            return;
+        }
+        if (now - equipmentRequestedAt > 10000) StopRun("换装后职业或古武未匹配，已停止；请检查套装中的装备是否仍在身上");
+    }
+
     private void StartRun(RunMode requested)
     {
         if (mode != RunMode.Idle) { executionStatus = "正在运行，请先停止"; return; }
         if (ownsDuty || ownsMovement || ownsOverrides || rotationPreset != null) { executionStatus = "上次执行的资源尚未清理，不能开始"; return; }
         var currentFate = FateManager.Instance();
-        var resumeFate = requested == RunMode.Fates && bookId is 1 or 2 && currentFate != null
+        var resumeFate = requested == RunMode.Fates && currentFate != null
             && !condition[ConditionFlag.BoundByDuty]
             && Enumerable.Range(0, 3).Any(i => !fates[i] && (currentFate->GetCurrentFateId() == fateIds[i]
                 || FatePrecursor(i) != 0 && currentFate->GetCurrentFateId() == FatePrecursor(i)));
@@ -533,8 +718,8 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         { executionStatus = "AutoDuty 已在运行，请先结束它的任务"; return; }
         if (requested != RunMode.Dungeons && (IpcBool("vnavmesh.Path.IsRunning") || IpcBool("vnavmesh.SimpleMove.PathfindInProgress")))
         { executionStatus = "vnavmesh 已有移动或寻路任务"; return; }
-        if (requested == RunMode.Fates && (bookId is not (1 or 2) || objectTable.LocalPlayer.ClassJob.RowId != 24))
-        { executionStatus = "FATE 验证目前仅支持第一、二卷白魔法师"; return; }
+        if (requested == RunMode.Fates && objectTable.LocalPlayer.ClassJob.RowId != 24)
+        { executionStatus = "当前 FATE 自动战斗配置仅支持白魔法师"; return; }
         fateSlot = -1;
         activeFateId = 0;
         fateEngaged = false;
@@ -576,7 +761,12 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         crystalFailures.Clear();
         lastProgress = monsters.Sum(x => (int)x);
         progressAt = phaseAt = Environment.TickCount64;
-        executionStatus = requested == RunMode.Nearby ? "扫描附近未完成目标" : "准备运行未完成副本";
+        executionStatus = requested switch
+        {
+            RunMode.Nearby => "扫描附近未完成目标", RunMode.WorldMonsters => "准备完成书本怪物",
+            RunMode.Leves => "准备执行书本理符", RunMode.Fates => "准备巡查书本 FATE",
+            RunMode.Exchange => "本卷已完成，准备前往摩杜纳换书", _ => "准备运行未完成副本"
+        };
     }
 
     private bool CanResumeLeveDialog()
@@ -598,7 +788,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private bool CanResumeActiveLeve()
     {
         var slot = Array.FindIndex(leves, x => !x);
-        if (slot < 0 || leveIds[slot] is not (644 or 849 or 868 or 645 or 853 or 875 or 646 or 860 or 863)) return false;
+        if (slot < 0 || !SupportsLeve(leveIds[slot])) return false;
         var quests = QuestManager.Instance();
         return quests != null && quests->GetLeveQuestById((ushort)leveIds[slot]) != null
             && FindLeveDirector((ushort)leveIds[slot]) != null;
@@ -645,8 +835,32 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         }
         if (player == null || DalamudServices.PlayerState.ContentId != runCharacter || mode != RunMode.Exchange && bookId != runBook || relicId != runRelic)
         { StopRun("角色或书本已变化"); return; }
-        if (!HasRequiredWeapon() || player.CurrentHp == 0 || condition[ConditionFlag.Unconscious])
-        { StopRun("装备发生变化或角色死亡"); return; }
+        if (player.CurrentHp == 0 || condition[ConditionFlag.Unconscious])
+        {
+            if (deathPausedAt == 0) { deathPausedAt = Environment.TickCount64; StopPath(); RestoreFateRotation(); }
+            executionStatus = "角色已死亡，暂停执行；复活后自动恢复";
+            return;
+        }
+        if (deathPausedAt != 0)
+        {
+            var delay = Environment.TickCount64 - deathPausedAt;
+            progressAt += delay; leveAt += delay; fateRunAt += delay; phaseAt += delay;
+            deathPausedAt = 0;
+            if (mode == RunMode.Fates)
+            {
+                fateEngaged = false; fateEndedAt = 0; activeFateId = 0;
+                Array.Clear(fateVisited); fateRoundResumeAt = 0;
+            }
+        }
+        if (preparingEquipment) return;
+        if (!HasRequiredWeapon())
+        {
+            if (condition[ConditionFlag.InCombat] || condition[ConditionFlag.BoundByDuty])
+            { executionStatus = "古武未装备，等待脱战或退出副本后自动恢复装备"; return; }
+            PrepareAutoEquipment();
+            if (!preparingEquipment && !autoBooks) StopRun(executionStatus);
+            return;
+        }
         if (condition[ConditionFlag.Gathering] || condition[ConditionFlag.Crafting])
         { StopRun("检测到采集或制作，已停止"); return; }
         if (mode == RunMode.Dungeons) { DriveDuty(); return; }
@@ -728,7 +942,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         24 => 119, 25 => 141, 27 => 163, 28 => 178, 30 => 2240, _ => 0
     };
 
-    private void DrivePath(Vector3 from, Vector3 to, bool allowMount = false)
+    private void DrivePath(Vector3 from, Vector3 to, bool allowMount = false, float maxSegment = 0)
     {
         if (rotationActive) RestoreFateRotation();
         if (Environment.TickCount64 < walkingRecoveryUntil && condition[ConditionFlag.Mounted]
@@ -747,7 +961,9 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             try { if (!PrepareDismount(from)) return; }
             finally { preparingGroundLanding = false; }
         }
-        var groundOnly = Environment.TickCount64 < flightFallbackUntil || HasOverheadObstacle(from) || HasOverheadObstacle(to);
+        // Try flight first. Roofs at either endpoint do not prove the whole route
+        // is unflyable; only an actual flight failure starts a ground fallback.
+        var groundOnly = Environment.TickCount64 < flightFallbackUntil;
         if (groundOnly && !preparingGroundLanding)
         {
             if (condition[ConditionFlag.InFlight])
@@ -775,14 +991,39 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             pathTask = null;
             List<Vector3> points;
             try { points = task.GetAwaiter().GetResult(); }
-            catch (Exception ex) when (pathFlying && !condition[ConditionFlag.InFlight])
+            catch (Exception ex) when (pathFlying)
             {
                 flightFallbackUntil = Environment.TickCount64 + 60000;
                 travelStatus = $"该段飞行寻路不可用，改用坐骑地面路线：{ex.GetBaseException().Message}";
                 return;
             }
-            if (points.Count == 0) throw new InvalidOperationException("未找到可用路线");
+            if (points.Count == 0)
+            {
+                if (pathFlying)
+                {
+                    flightFallbackUntil = Environment.TickCount64 + 60000;
+                    pathFlying = false;
+                    travelStatus = "未找到飞行路线，临时改走地面";
+                    return;
+                }
+                throw new InvalidOperationException("未找到可用地面路线");
+            }
             if (IpcBool("vnavmesh.Path.IsRunning")) throw new InvalidOperationException("其他移动任务已占用寻路插件");
+            if (maxSegment > 0)
+            {
+                var segment = new List<Vector3>();
+                var cursor = from;
+                var remaining = maxSegment;
+                foreach (var point in points)
+                {
+                    var length = Vector3.Distance(cursor, point);
+                    if (length > remaining)
+                    { segment.Add(Vector3.Lerp(cursor, point, remaining / length)); break; }
+                    segment.Add(point); remaining -= length; cursor = point;
+                    if (remaining <= 0) break;
+                }
+                points = segment;
+            }
             ownsMovement = true;
             DalamudServices.PluginInterface.GetIpcSubscriber<List<Vector3>, bool, object>("vnavmesh.Path.MoveTo").InvokeAction(points, pathFlying);
             phaseAt = Environment.TickCount64;
@@ -803,13 +1044,20 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             {
                 var wasFlying = pathFlying;
                 StopPath();
-                flightFallbackUntil = now + 120000;
-                if (!wasFlying && condition[ConditionFlag.Mounted])
+                if (wasFlying) flightFallbackUntil = now + 60000;
+                var retryFlight = !wasFlying && config.UseFlight && Control.CanFly;
+                if (retryFlight)
+                {
+                    flightFallbackUntil = 0;
+                    walkingRecoveryUntil = mountFallbackUntil = 0;
+                }
+                else if (!wasFlying && condition[ConditionFlag.Mounted])
                 {
                     walkingRecoveryUntil = now + 60000;
                     mountFallbackUntil = walkingRecoveryUntil;
                 }
-                travelStatus = wasFlying ? "飞行移动停滞，停止旧路径并落地改走地面" : "地面移动停滞，重新寻路";
+                travelStatus = wasFlying ? "飞行移动停滞，落地后临时改走地面"
+                    : retryFlight ? "地面路线受阻，重新尝试飞行" : "地面移动受阻，下坐骑重新寻路";
                 if (++stalledPathRetries > 2) StopRun("连续三次移动停滞，已停止，避免反复卡住");
                 return;
             }
@@ -830,14 +1078,12 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         pathCancellation = new CancellationTokenSource();
         phaseAt = Environment.TickCount64;
         pathFlying = preparingGroundLanding || !groundOnly && (condition[ConditionFlag.InFlight] || config.UseFlight && condition[ConditionFlag.Mounted] && Control.CanFly
-            && Environment.TickCount64 >= flightFallbackUntil && Vector3.Distance(from, to) >= 80);
+            && Environment.TickCount64 >= flightFallbackUntil && Vector3.Distance(from, to) >= 50);
         travelStatus = pathFlying ? "坐骑飞行寻路" : condition[ConditionFlag.Mounted] ? "坐骑地面寻路" : "步行寻路";
         pathTask = DalamudServices.PluginInterface.GetIpcSubscriber<Vector3, Vector3, bool, CancellationToken, Task<List<Vector3>>>("vnavmesh.Nav.PathfindCancelable")
             .InvokeFunc(from, pathFlying ? to + new Vector3(0, 8, 0) : to, pathFlying, pathCancellation.Token);
     }
 
-    private static bool HasOverheadObstacle(Vector3 point) =>
-        BGCollisionModule.RaycastMaterialFilter(point + new Vector3(0, 2, 0), Vector3.UnitY, out _, 20f);
 
     private bool PrepareMount(float distance)
     {
@@ -910,7 +1156,9 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                 }
                 StopPath(); landingApproachGoal = null;
             }
-            if (HorizontalDistance(player.Position, destination) > 35)
+            // Finish the flight approach before descending; a nearby point on
+            // the wrong side of a cliff is not a useful destination landing.
+            if (HorizontalDistance(player.Position, destination) > 8)
             { DrivePath(player.Position, destination); return false; }
             var floor = DalamudServices.PluginInterface.GetIpcSubscriber<Vector3, bool, float, Vector3?>("vnavmesh.Query.Mesh.PointOnFloor")
                 .InvokeFunc(player.Position + new Vector3(0, 2, 0), false, 6f);
@@ -1089,7 +1337,8 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             ConfirmLeveReturn();
             return;
         }
-        if (leveSlot >= 0 && leves[leveSlot] && refreshLeveId == 0)
+        if (leveSlot >= 0 && leves[leveSlot] && refreshLeveId == 0
+            && QuestManager.Instance() != null && QuestManager.Instance()->GetLeveQuestById((ushort)leveIds[leveSlot]) == null)
         {
             StopPath();
             if (FindAddon("SelectString") != null)
@@ -1102,12 +1351,17 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         }
         if (leveSlot < 0)
         {
-            leveSlot = Array.FindIndex(leves, complete => !complete);
+            var pendingQuests = QuestManager.Instance();
+            leveSlot = Enumerable.Range(0, 3).FirstOrDefault(i => pendingQuests != null
+                && pendingQuests->GetLeveQuestById((ushort)leveIds[i]) != null, -1);
+            if (leveSlot < 0) leveSlot = Array.FindIndex(leves, complete => !complete);
             if (leveSlot < 0) { StopRun("全部理符目标已完成", true); return; }
-            if (leveIds[leveSlot] is not (644 or 849 or 868 or 645 or 853 or 875 or 646 or 860 or 863))
+            if (!SupportsLeve(leveIds[leveSlot]))
             { StopRun($"该理符尚无执行策略：{leveLabels[leveSlot]}"); return; }
             leveAt = Environment.TickCount64;
             patrolPoint = 0; patrolArrivedAt = 0;
+            dogGuideInitialized = false; dogGuidePhase = 0;
+            dogBeckonAt = 0; dogNoFollowAttempts = 0;
             levePhase = "前往发行人";
             teleportRequested = false;
             // Resume an already accepted supported backup at the same issuer after reload.
@@ -1132,6 +1386,33 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         if (quests == null) return;
         var work = quests->GetLeveQuestById((ushort)id);
         var leveName = leve.Name.ExtractText();
+        if (id == 647 && work != null && work->Sequence == 3)
+        {
+            StopPath();
+            if (rotationActive) RestoreFateRotation();
+            levePhase = executionStatus = "警犬引导失败，准备重新挑战";
+            if (Environment.TickCount64 < leveUiAt) return;
+            if (quests->NumLeveAllowances == 0)
+            { StopRun("理符受理权用尽，暂缓失败理符，继续本书其他任务", autoBooks); return; }
+            if (dogRetryAttempts >= 2 || quests->NumLeveAllowances < 2)
+            { StopRun("引导重试达到上限或受理权不足，保留最后1次受理权"); return; }
+            var retry = (AddonSelectYesno*)FindAddon("SelectYesno");
+            if (retry != null && retry->PromptText != null
+                && retry->PromptText->NodeText.ToString().Contains("重新挑战理符任务"))
+            {
+                dogRetryAttempts++;
+                dogGuideInitialized = false; dogGuidePhase = 0; dogBeckonAt = 0; dogNoFollowAttempts = 0;
+                retry->FireCallbackInt(0);
+                leveUiAt = Environment.TickCount64 + 5000;
+                return;
+            }
+            var journal = (AddonJournalDetail*)FindAddon("JournalDetail");
+            if (journal != null && JournalMatches((AtkUnitBase*)journal, leveName))
+                ClickButton((AtkUnitBase*)journal, journal->GetComponentButtonById(51));
+            else AgentQuestJournal.Instance()->OpenForQuest(id, 2);
+            leveUiAt = Environment.TickCount64 + 1500;
+            return;
+        }
         if (refreshLeveId != 0 && work != null) refreshLeveAccepted = true;
         if (refreshLeveId != 0 && refreshLeveAccepted && work == null)
         {
@@ -1150,7 +1431,8 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         executionStatus = $"理符：{leveName}；{levePhase}";
         if (work == null)
         {
-            if (quests->NumLeveAllowances == 0) { StopRun("没有理符受理权"); return; }
+            if (quests->NumLeveAllowances == 0)
+            { StopRun("理符受理权用尽，暂缓未受理理符，继续本书其他任务", autoBooks); return; }
             if (!TravelToLevel(leve.LevelLevemete.RowId)) return;
             if (Environment.TickCount64 < leveUiAt) return;
             leveUiAt = Environment.TickCount64 + 1000;
@@ -1231,7 +1513,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                 }
             }
             if (yesno != null && yesno->PromptText != null
-                && yesno->PromptText->NodeText.ToString().Contains("目标地点附近的集落", StringComparison.Ordinal))
+                && IsLeveReturnText(yesno->PromptText->NodeText.ToString()))
             {
                 StopPath();
                 levePhase = "确认免费返回交付集落";
@@ -1340,12 +1622,13 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             {
                 if (enemy == null || Vector3.Distance(player.Position, battle.Position) < Vector3.Distance(player.Position, enemy.Position)) enemy = battle;
             }
-            if ((id == 644 && obj.BaseId == 2001098 || id == 646 && obj.BaseId == 2001104
+            if ((id == 644 && obj.BaseId == 2001098 || id is 646 or 652 && obj.BaseId == 2001104
                 || id == 645 && obj.ObjectKind == ObjectKind.EventObj) && (objective == null
                 || Vector3.DistanceSquared(player.Position, obj.Position) < Vector3.DistanceSquared(player.Position, objective.Position))) objective = obj;
         }
         if (id == 645 && DriveLureLeve(leveActors, objective)) return;
         if (id == 849 && DriveImpostorLeve(leveActors)) return;
+        if (id == 647) { DriveDogLeve(leveActors, leve.LevelLevemete.RowId); return; }
         if (enemy != null) { AttackLeveEnemy(enemy); return; }
         if (objective != null)
         {
@@ -1361,33 +1644,156 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             TargetSystem.Instance()->InteractWithObject((NativeGameObject*)objective.Address);
             return;
         }
-        if (id == 646)
+        if (id is 646 or 649 or 652)
         {
             if (rotationActive) RestoreFateRotation();
-            var probe = Patrol646Points[patrolPoint];
+            var searchPoints = id == 646 ? Patrol646Points : id == 649 ? Search649Points : Patrol652Points;
+            patrolPoint %= searchPoints.Length;
+            var probe = searchPoints[patrolPoint];
             var ground = DalamudServices.PluginInterface.GetIpcSubscriber<Vector3, float, float, Vector3?>("vnavmesh.Query.Mesh.NearestPointReachable")
                 .InvokeFunc(probe, 15f, 20f);
             if (!ground.HasValue) { StopRun("巡逻点未找到可达地面，已停止"); return; }
-            levePhase = executionStatus = $"巡查任务地点 {patrolPoint + 1}/{Patrol646Points.Length}，寻找巡逻标记或敌人";
+            levePhase = executionStatus = $"搜索任务地点 {patrolPoint + 1}/{searchPoints.Length}，寻找本理符目标";
             if (HorizontalDistance(player.Position, ground.Value) > 5)
             { patrolArrivedAt = 0; DrivePath(player.Position, ground.Value); return; }
             StopPath();
             if (patrolArrivedAt == 0) patrolArrivedAt = Environment.TickCount64;
             if (Environment.TickCount64 - patrolArrivedAt > 5000)
-            { patrolPoint = (patrolPoint + 1) % Patrol646Points.Length; patrolArrivedAt = 0; }
+            { patrolPoint = (patrolPoint + 1) % searchPoints.Length; patrolArrivedAt = 0; }
             return;
         }
         StopPath();
         executionStatus += "；等待属于本理符的目标出现";
     }
 
+    private void DriveDogLeve(List<IBattleNpc> actors, uint issuerLevel)
+    {
+        var player = objectTable.LocalPlayer;
+        if (player == null) return;
+        var dog = actors.FirstOrDefault(x => x.NameId == 1014 && x.CurrentHp > 0);
+        if (dog == null)
+        { StopPath(); levePhase = executionStatus = "等待本理符的艾玛吉娜看门犬加载"; return; }
+        if (!LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Level>(issuerLevel, out var level))
+        { StopRun("无法读取警犬返回地点"); return; }
+        var home = new Vector3(level.X, level.Y, level.Z);
+        if (condition[ConditionFlag.Casting]) return;
+        if (dog.CurrentHp < dog.MaxHp * 0.85f && player.ClassJob.RowId == 24
+            && ActionManager.CanUseActionOnTarget(135, (NativeGameObject*)dog.Address))
+        {
+            var actions = ActionManager.Instance();
+            if (actions != null && actions->GetActionStatus(ActionType.Action, 135, dog.GameObjectId) == 0)
+            {
+                StopPath();
+                if (rotationActive) RestoreFateRotation();
+                actions->UseAction(ActionType.Action, 135, dog.GameObjectId);
+                levePhase = executionStatus = "优先治疗受伤的警犬";
+                return;
+            }
+        }
+        var ahead = home - player.Position; ahead.Y = 0;
+        if (ahead.LengthSquared() > 1) ahead = Vector3.Normalize(ahead);
+        var threat = objectTable.OfType<IBattleNpc>().Where(x => x.CurrentHp > 0 && x.IsTargetable
+            && x.GameObjectId != dog.GameObjectId && Vector3.Distance(x.Position, player.Position) < 45
+            && !TargetTemporarilyBlocked(x) && ActionManager.CanUseActionOnTarget(BaseAction(), (NativeGameObject*)x.Address))
+            .Where(x =>
+            {
+                if (x.TargetObjectId == dog.EntityId || x.TargetObjectId == player.EntityId) return true;
+                if (((NativeGameObject*)x.Address)->FateId != 0) return false;
+                var relative = x.Position - player.Position; relative.Y = 0;
+                var forward = Vector3.Dot(relative, ahead);
+                return HorizontalDistance(x.Position, dog.Position) < 20
+                    || forward >= 0 && forward <= 30 && (relative - ahead * forward).Length() < 15;
+            })
+            .OrderBy(x => x.TargetObjectId == dog.EntityId ? 0 : x.TargetObjectId == player.EntityId ? 1 : 2)
+            .ThenBy(x => Vector3.DistanceSquared(x.Position, dog.Position)).FirstOrDefault();
+        if (threat != null)
+        {
+            dogProtecting = true;
+            levePhase = executionStatus = $"保护警犬，先清理沿途敌人：{threat.Name}";
+            if (PrepareEnemyFateSync(threat)) AttackLeveEnemy(threat);
+            return;
+        }
+        if (dogProtecting)
+        { StopPath(); dogGuideInitialized = false; dogGuidePhase = 0; dogProtecting = false; }
+        if (rotationActive) RestoreFateRotation();
+        if (!PrepareDismount(dog.Position)) return;
+        var distance = Vector3.Distance(player.Position, dog.Position);
+        var now = Environment.TickCount64;
+        if (!dogGuideInitialized)
+        {
+            if (distance > 12)
+            { levePhase = executionStatus = "首次接近警犬，准备分段引导"; DrivePath(player.Position, dog.Position); return; }
+            dogGuideInitialized = true;
+            dogGuidePhase = 0;
+        }
+        if (dogGuidePhase == 0)
+        {
+            dogStepStart = player.Position;
+            dogPhaseAt = now;
+            dogGuidePhase = 1;
+        }
+        if (dogGuidePhase == 1)
+        {
+            var moved = HorizontalDistance(player.Position, dogStepStart);
+            if (moved >= 13 || HorizontalDistance(player.Position, new(level.X, level.Y, level.Z)) < 3
+                || moved > 2 && now - dogPhaseAt > 1500 && pathTask == null && !IpcBool("vnavmesh.Path.IsRunning"))
+            { StopPath(); dogGuidePhase = 2; dogPhaseAt = now; }
+            else
+            {
+                levePhase = executionStatus = "先向营地方向步行一段，再停下招手";
+                DrivePath(player.Position, new Vector3(level.X, level.Y, level.Z), false, 14);
+                return;
+            }
+        }
+        if (dogGuidePhase == 2)
+        {
+            StopPath();
+            if (now - dogPhaseAt < 750) return;
+            if (distance > 25)
+            { dogGuideInitialized = false; levePhase = executionStatus = "警犬掉队过远，重新接近后引导"; return; }
+            targetManager.Target = dog; targetId = dog.GameObjectId;
+            var emotes = EmoteManager.Instance();
+            var option = new EmoteController.PlayEmoteOption { TargetId = dog.GameObjectId, DisableLogMessage = true };
+            if (emotes != null && emotes->CanExecuteEmote(8) && emotes->ExecuteEmote(8, &option))
+            {
+                dogBeckonAt = now; dogLastBeckonPosition = dog.Position;
+                dogGuidePhase = 3;
+            }
+            levePhase = executionStatus = "已走到前方，向警犬招手";
+            return;
+        }
+        StopPath();
+        levePhase = executionStatus = "原地等待警犬跟上，再走下一段";
+        if (now - dogBeckonAt >= 1500 && distance <= 5)
+        { dogNoFollowAttempts = 0; dogGuidePhase = 0; return; }
+        if (now - dogBeckonAt > 12000)
+        {
+            if (HorizontalDistance(dog.Position, dogLastBeckonPosition) < 1 && ++dogNoFollowAttempts >= 3)
+            { StopRun("警犬三次未确认跟随，已停止并保留任务"); return; }
+            dogGuidePhase = 2; dogPhaseAt = now;
+        }
+    }
+    private static bool SupportsLeve(uint id) =>
+        id is 644 or 645 or 646 or 647 or 649 or 652 or 849
+        || LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Leve>(id, out var row) && row.LeveVfx.RowId is 21 or 22 or 36;
+
+    private static bool SupportsFate(ushort id) =>
+        id is 611 or 571 or 424 or 633
+        || LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Fate>(id, out var row) && row.Rule == 1 && row.Icon is 60721 or 60722;
+
     private bool HasLeveReturnPrompt()
     {
         var confirm = (AddonSelectYesno*)FindAddon("SelectYesno");
         if (confirm == null || confirm->PromptText == null
-            || !confirm->PromptText->NodeText.ToString().Contains("目标地点附近的集落")) return false;
+            || !IsLeveReturnText(confirm->PromptText->NodeText.ToString())) return false;
         return true;
     }
+
+    private static bool IsLeveReturnText(string text) =>
+        text.Contains("目标地点附近的集落", StringComparison.Ordinal)
+        || (text.Contains("要回到", StringComparison.Ordinal) || text.Contains("要返回", StringComparison.Ordinal))
+            && text.Contains("理符发行人", StringComparison.Ordinal)
+            && (text.Contains("身边", StringComparison.Ordinal) || text.Contains("附近", StringComparison.Ordinal));
 
     private void ConfirmLeveReturn()
     {
@@ -1872,8 +2278,8 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         for (var i = 0; i < Math.Clamp(ui->Hater.HaterCount, 0, 32); i++)
             ids.Add(ui->Hater.Haters[i].EntityId);
         return objectTable.OfType<IBattleNpc>().Where(x => x.CurrentHp > 0 && x.IsTargetable
-            && ids.Contains(x.EntityId) && x.TargetObjectId == player.EntityId
-            && ActionManager.CanUseActionOnTarget(BaseAction(), (NativeGameObject*)x.Address)).ToList();
+            && (ids.Contains(x.EntityId) || x.TargetObjectId == player.EntityId
+                && ActionManager.CanUseActionOnTarget(BaseAction(), (NativeGameObject*)x.Address))).ToList();
     }
 
     private bool DriveFateAggressors(FateManager* manager)
@@ -1891,6 +2297,12 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         if (attackers.Any(x => ((NativeGameObject*)x.Address)->FateId != 0) && DriveFateEscape(manager)) return true;
         if (attackers.Length == 0)
         {
+            if (condition[ConditionFlag.InCombat])
+            {
+                if (manager->CurrentFate != null && DriveFateEscape(manager)) return true;
+                fateCleanupStatus = executionStatus = "战斗状态尚未解除，等待敌对列表刷新或敌人返回后继续";
+                return true;
+            }
             if (clearingFateAggressors)
             {
                 StopPath();
@@ -2031,6 +2443,11 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                 .ThenBy(i => fateVisited[i]).ThenBy(i => FateWaitPoint(i).Territory == clientState.TerritoryType ? 0 : 1).First();
             fateWaitAt = now; fateEngaged = false; fateEndedAt = 0; activeFateId = 0;
         }
+        if (!SupportsFate(fateIds[fateSlot]))
+        {
+            StopRun($"该 FATE 的机制尚未支持：{fateLabels[fateSlot]}（{fateIds[fateSlot]}），需要补充交互策略");
+            return;
+        }
         var place = FateWaitPoint(fateSlot);
         if (!TravelFateTerritory(place.Territory)) return;
         // Scan after loading at the aetheryte; do not travel to a dormant spawn point.
@@ -2080,7 +2497,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             {
                 var talk = FindAddon("Talk");
                 if (talk != null && now >= nextFateUiAt)
-                { StopPath(); talk->FireCallbackInt(0); nextFateUiAt = now + 1200; return; }
+                { StopPath(); AdvanceTalk(); nextFateUiAt = now + 1200; return; }
                 var confirm = (AddonSelectYesno*)FindAddon("SelectYesno");
                 if (confirm != null && confirm->PromptText != null)
                 {
@@ -2102,8 +2519,8 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         }
         var pos = player.Position;
         if (manager->GetCurrentFateId() != activeFateId || !manager->IsInFateRadius(&pos))
-        { DrivePath(player.Position, location, true); return; }
-        if (!PrepareDismount(location)) return;
+        { executionStatus = $"前往 {fateLabels[fateSlot]}，距离 {HorizontalDistance(player.Position, location):F0} 米"; DrivePath(player.Position, location, true); return; }
+        if (!PrepareDismount(location)) { executionStatus = $"接近 {fateLabels[fateSlot]}，准备降落"; return; }
         if (player.Level > context->MaxLevel && !manager->IsSyncedToFate(context))
         {
             StopPath();
@@ -2444,6 +2861,9 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 
     private void StopRun(string reason, bool completed = false)
     {
+        preparingEquipment = false;
+        equipmentContextPending = false;
+        deathPausedAt = 0;
         if (!completed) { autoBooks = false; autoStatus = reason; }
         else autoNextAt = Environment.TickCount64 + 2000;
         mode = RunMode.Idle;
@@ -2478,6 +2898,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 
     private void DriveAutoBooks()
     {
+        if (objectTable.LocalPlayer?.CurrentHp == 0 || condition[ConditionFlag.Unconscious]) return;
         if (!autoBooks || mode != RunMode.Idle || Environment.TickCount64 < autoNextAt) return;
         if (condition[ConditionFlag.Casting] || condition[ConditionFlag.BetweenAreas]) return;
         if ((condition[ConditionFlag.OccupiedInEvent] || condition[ConditionFlag.OccupiedInQuestEvent]) && !CanResumeLeveDialog() && !HasLeveReturnPrompt())
@@ -2493,10 +2914,29 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         }
         var manager = FateManager.Instance();
         if (manager != null && DriveFateAggressors(manager)) return;
+        if (condition[ConditionFlag.InCombat])
+        { executionStatus = "等待战后清理或脱战完成，再继续下一阶段"; return; }
         singleDuty = singleLeve = false;
+        var quests = QuestManager.Instance();
+        var hasAllowance = quests != null && quests->NumLeveAllowances > 0;
+        var runnableAcceptedLeve = false;
+        if (quests != null)
+        {
+            foreach (var id in leveIds.Concat(new[] { refreshLeveId }).Where(id => id != 0))
+            {
+                var work = quests->GetLeveQuestById((ushort)id);
+                if (work != null && (work->Sequence != 3 || hasAllowance)) { runnableAcceptedLeve = true; break; }
+            }
+        }
+        var canRunLeves = runnableAcceptedLeve || hasAllowance && leves.Any(x => !x);
         var next = !Enumerable.Range(0, 10).All(i => monsters[i] >= monsterRequired[i]) ? RunMode.WorldMonsters
-            : dungeons.Any(x => !x) ? RunMode.Dungeons : leves.Any(x => !x) ? RunMode.Leves
+            : dungeons.Any(x => !x) ? RunMode.Dungeons : canRunLeves ? RunMode.Leves
             : fates.Any(x => !x) ? RunMode.Fates : RunMode.Exchange;
+        if (next == RunMode.Exchange && (!BookComplete() || HasPendingBookLeve()))
+        {
+            StopRun("本书其他任务已完成；剩余理符因受理权不足暂缓，已停止，恢复受理权后可继续");
+            return;
+        }
         if (next == RunMode.Exchange && bookId >= 9)
         { autoBooks = false; autoStatus = executionStatus = "最后一卷已完成，连续执行结束"; return; }
         autoStatus = $"连续书本：{bookName} → {next}";
@@ -2520,6 +2960,90 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             e->Listener->ReceiveEvent(e->State.EventType, (int)e->Param, e);
             return true;
         }
+        return false;
+    }
+
+    private string BookHistoryPath() => System.IO.Path.Combine(
+        DalamudServices.PluginInterface.GetPluginConfigDirectory(), $"AnimusBookAssistant.books.{historyCharacter}.json");
+
+    private void ObserveBookHistory()
+    {
+        var character = DalamudServices.PlayerState.ContentId;
+        if (character == 0 || relicId == 0 || bookId is < 1 or > 9 || !labelsReady) return;
+        if (historyCharacter != character)
+        {
+            historyCharacter = character;
+            bookHistory = new(); historyWritable = true; historyDirty = false; historyRetryAt = 0;
+            try
+            {
+                var path = BookHistoryPath();
+                if (System.IO.File.Exists(path)) bookHistory = JsonSerializer.Deserialize<Dictionary<string, BookHistoryEntry>>(
+                    System.IO.File.ReadAllText(path)) ?? new();
+                historyStatus = "记录按角色与古武分别保存；未知不代表未完成。";
+            }
+            catch (Exception ex)
+            {
+                historyWritable = false;
+                historyStatus = $"历史记录读取失败，暂不覆盖原文件：{ex.Message}";
+            }
+        }
+        var key = $"{relicId}:{bookId}";
+        if (!bookHistory.TryGetValue(key, out var entry) || entry == null)
+        {
+            entry = new BookHistoryEntry { FirstSeen = DateTimeOffset.UtcNow };
+            bookHistory[key] = entry;
+            historyDirty = true;
+        }
+        if (!entry.Completed && BookComplete())
+        {
+            entry.Completed = true; entry.CompletedAt = DateTimeOffset.UtcNow;
+            historyDirty = true;
+        }
+        if (!historyDirty || !historyWritable || Environment.TickCount64 < historyRetryAt) return;
+        try
+        {
+            var path = BookHistoryPath();
+            System.IO.File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(bookHistory, new JsonSerializerOptions { WriteIndented = true }));
+            System.IO.File.Move(path + ".tmp", path, true);
+            historyDirty = false;
+            historyStatus = "记录按角色与古武分别保存；未知不代表未完成。";
+        }
+        catch (Exception ex)
+        {
+            historyRetryAt = Environment.TickCount64 + 30000;
+            historyStatus = $"历史记录保存失败，当前仅保留在内存：{ex.Message}";
+        }
+    }
+
+    private void DrawBookOverview()
+    {
+        if (!ImGui.CollapsingHeader("九本书总览")) return;
+        if (relicId == 0 || historyCharacter != DalamudServices.PlayerState.ContentId)
+        { ImGui.TextWrapped("请先读取当前角色的古武书本。"); return; }
+        ImGui.TextWrapped($"当前古武：{(LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Item>(requiredWeapon, out var weapon) ? weapon.Name.ExtractText() : requiredWeapon.ToString())}");
+        var complete = 0;
+        for (uint i = 1; i <= 9; i++)
+        {
+            bookHistory.TryGetValue($"{relicId}:{i}", out var entry);
+            if (entry?.Completed == true) complete++;
+            var label = LuminaGetter.TryGetRow<SheetRelicNote>(i, out var row) ? row.EventItem.Value.Singular.ToString() : $"书本 {i}";
+            var state = entry?.Completed == true ? "已完成" : i == bookId ? "进行中" : entry != null ? "曾读取" : "未知";
+            var color = entry?.Completed == true ? new Vector4(0.35f, 0.8f, 0.55f, 1)
+                : i == bookId ? new Vector4(1, 0.75f, 0.3f, 1) : new Vector4(0.65f, 0.68f, 0.72f, 1);
+            ImGui.TextColored(color, state);
+            ImGui.SameLine(); ImGui.TextWrapped($"{label}{(i == bookId ? "（当前）" : "")}");
+        }
+        ImGui.TextUnformatted($"已确认完成 {complete} / 9 本");
+        ImGui.TextWrapped("未知：没有可靠历史记录。曾读取：插件见过这本书，但未确认全项完成。不会按当前卷数推断之前书本已完成。");
+        ImGui.TextWrapped(historyStatus);
+    }
+
+    private bool HasPendingBookLeve()
+    {
+        var quests = QuestManager.Instance();
+        if (quests == null) return false;
+        for (var i = 0; i < leveIds.Length; i++)
+            if (leveIds[i] != 0 && quests->GetLeveQuestById((ushort)leveIds[i]) != null) return true;
         return false;
     }
 
@@ -2595,13 +3119,21 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 
     private string GetStatusJson() => JsonSerializer.Serialize(new
     {
-        buildMvid = typeof(AnimusBookAssistant).Module.ModuleVersionId, enabled = IsEnabled,
+        version = ReleaseVersion, buildMvid = typeof(AnimusBookAssistant).Module.ModuleVersionId, enabled = IsEnabled,
         bookId, relicId, bookName, requiredWeapon, objectiveBits, dutyCompletionObserved = dutyCompletedAt != 0, dutyExitRequested,
         mode = mode.ToString(), executionStatus, diagnostics, spawnStatus, levePhase, leveDebug, travelStatus, autoBooks, autoStatus,
+        preparingEquipment, equipmentStatus, equipmentJob, equipmentWeapon, equipmentContextPending, deathPausedAt,
+        historyStatus,
+        bookOverview = Enumerable.Range(1, 9).Select(i => new
+        {
+            book = i, current = i == bookId,
+            completed = bookHistory.TryGetValue($"{relicId}:{i}", out var entry) && entry?.Completed == true,
+            observed = bookHistory.ContainsKey($"{relicId}:{i}")
+        }).ToArray(),
         refreshLeveId, leveRefreshAttempts, refreshLeveAccepted, refreshRewardRequested,
         useMount = config.UseMount, useFlight = config.UseFlight, pathFlying,
         landing, landingApproachGoal, landingSearchAt,
-        lastRangeOrLos, lastActionStatus, fateIds, activeFateId, fateSlot, fatePhase, fateEngaged,
+        lastRangeOrLos, fateIds, activeFateId, fateSlot, fatePhase, fateEngaged,
         rotationPreset, rotationActive, companionStatus, clearingFateAggressors, fateCleanupStatus,
         startBlockedReason = StartBlockedReason(),
         status, monsters = monsters.Select(x => (int)x).ToArray(), monsterRequired = monsterRequired.Select(x => (int)x).ToArray(), monsterLabels, dungeons, dungeonNames, dungeonTerritories,
@@ -2622,11 +3154,16 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 
     private void DrawContent()
     {
-        var running = autoBooks || mode != RunMode.Idle;
+        var running = preparingEquipment || autoBooks || mode != RunMode.Idle;
         var ready = lastRead != null && !failed && bookId != 0;
         ImGui.TextUnformatted(ready ? bookName : "等待读取当前书本");
+        var stage = preparingEquipment ? "准备装备" : deathPausedAt != 0 ? "等待复活" : mode switch
+        {
+            RunMode.WorldMonsters or RunMode.Nearby => "怪物任务", RunMode.Dungeons => "副本任务",
+            RunMode.Leves => "理符任务", RunMode.Fates => "FATE 巡查与战斗", RunMode.Exchange => "自动换书", _ => "准备下一阶段"
+        };
         ImGui.TextColored(running ? new Vector4(0.35f, 0.8f, 0.55f, 1) : new Vector4(0.65f, 0.68f, 0.72f, 1),
-            running ? "执行中" : "已停止 / 待机");
+            running ? $"执行中 · {stage}" : "已停止 / 待机");
         ImGui.Spacing();
         ImGui.BeginDisabled(running || !ready);
         if (ImGui.Button("开始连续执行", new Vector2(160, 32))) queuedAction = "auto";
@@ -2637,10 +3174,11 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         ImGui.EndDisabled();
         ImGui.Spacing();
         ImGui.TextWrapped(executionStatus);
-        if (running && travelStatus != "待机") ImGui.TextWrapped($"赶路 · {travelStatus}");
+        if (running && mode != RunMode.Dungeons && travelStatus != "待机") ImGui.TextWrapped($"赶路 · {travelStatus}");
         if (!ready) ImGui.TextWrapped(status);
         var blocked = StartBlockedReason();
-        if (!running && ready && blocked != null) ImGui.TextWrapped($"开始前请检查：{blocked}");
+        if (!running && ready && !HasRequiredWeapon()) ImGui.TextWrapped("开始时先切换对应职业，再从背包或兵装库单独装备古武。");
+        else if (!running && ready && blocked != null) ImGui.TextWrapped($"开始前请检查：{blocked}");
         ImGui.Spacing();
         ImGui.Separator();
         if (ready)
@@ -2669,15 +3207,20 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             }
         }
         ImGui.Spacing();
+        DrawBookOverview();
+        DrawTravelSettings();
         if (ImGui.CollapsingHeader("使用说明"))
         {
-            ImGui.TextWrapped("装备当前书本对应的古武后开始。连续模式依次执行怪物、副本、理符和 FATE；整卷完成后前往摩杜纳更换下一本书。停止会结束本模块的连续执行。");
+            ImGui.TextWrapped("开始时先用普通职业套装切换职业，再单独装备对应古武；已经是对应职业则只换武器。不需要保存古武套装，请将古武放在背包或兵装库；战斗中或副本内无法自动换装。连续模式依次执行怪物、副本、理符和 FATE，整卷完成后前往摩杜纳换书。停止会结束连续执行。");
             ImGui.TextWrapped("依赖：vnavmesh（赶路）、AutoDuty（副本）、BossMod Reborn（输出、治疗与自动移动）。FATE 前请备好基萨尔野菜。");
-            ImGui.TextWrapped("适配范围：前两卷已完成实测，第二卷至第三卷换书已验证；后续卷的特殊理符与 FATE 尚未完整适配，遇到不支持任务会停止。当前 FATE 自动执行仅支持前两卷白魔法师。");
+            ImGui.TextWrapped("按任务机制识别，不限制书本卷数：通用讨伐 FATE、迎击/歼敌/防卫理符可自动执行，已适配的特殊任务使用专用流程。其他特殊交互仍需适配；FATE 战斗配置目前仅支持白魔。实测覆盖前三卷及第四卷部分流程，后续卷尚未完整验证。");
             ImGui.TextWrapped("BMR 仅能躲避其已识别的危险区域。FATE 一轮未刷新时等待 5 分钟，战后立即重新巡查。");
         }
         if (ImGui.CollapsingHeader("更多与排错"))
         {
+            ImGui.TextUnformatted($"版本 {ReleaseVersion}");
+            ImGui.TextUnformatted($"构建 {typeof(AnimusBookAssistant).Module.ModuleVersionId}");
+            if (!string.IsNullOrEmpty(settingsStatus)) ImGui.TextWrapped(settingsStatus);
             if (!windowOpen && ImGui.Button("打开独立窗口")) windowOpen = true;
             if (ImGui.Button("检查依赖")) queuedAction = "diagnose";
             ImGui.SameLine();
@@ -2710,6 +3253,13 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     {
         for (var i = 0; i < flags.Length; i++)
             DrawObjective(labels[i], flags[i], "未完成");
+    }
+
+    public sealed class BookHistoryEntry
+    {
+        public DateTimeOffset FirstSeen { get; set; }
+        public bool Completed { get; set; }
+        public DateTimeOffset? CompletedAt { get; set; }
     }
 
     private sealed record TargetSnapshot(string Name, uint EntityId, uint DataId,
