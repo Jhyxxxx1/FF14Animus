@@ -41,7 +41,7 @@ namespace OmniToolbox.TreePublic;
 // 进度以客户端状态为准，执行由用户启动。
 public sealed unsafe class AnimusBookAssistant : ModuleBase
 {
-    private const string ReleaseVersion = "0.1.0-preview.2";
+    private const string ReleaseVersion = "0.1.0-preview.3";
     public override ModuleInfo Info { get; } = new()
     {
         Title = "古武小黄书助手",
@@ -379,20 +379,6 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     {
         DrawContent();
         return false;
-    }
-
-    private void DrawTravelSettings()
-    {
-        var changed = false;
-        if (ImGui.CollapsingHeader("赶路设置"))
-        {
-            var mount = config.UseMount;
-            if (ImGui.Checkbox("长途优先使用坐骑", ref mount)) { config.UseMount = mount; changed = true; }
-            var flight = config.UseFlight;
-            if (ImGui.Checkbox("可飞行时优先飞行", ref flight)) { config.UseFlight = flight; changed = true; }
-            ImGui.TextWrapped("无法起飞或通行受阻时自动回退地面路线。");
-        }
-        if (changed) SaveSettings();
     }
 
     private void Update(IFramework framework)
@@ -1043,7 +1029,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
                 var wasFlying = pathFlying;
                 StopPath();
                 if (wasFlying) flightFallbackUntil = now + 60000;
-                var retryFlight = !wasFlying && config.UseFlight && Control.CanFly;
+                var retryFlight = !wasFlying && Control.CanFly;
                 if (retryFlight)
                 {
                     flightFallbackUntil = 0;
@@ -1075,7 +1061,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         pathCancellation?.Dispose();
         pathCancellation = new CancellationTokenSource();
         phaseAt = Environment.TickCount64;
-        pathFlying = preparingGroundLanding || !groundOnly && (condition[ConditionFlag.InFlight] || config.UseFlight && condition[ConditionFlag.Mounted] && Control.CanFly
+        pathFlying = preparingGroundLanding || !groundOnly && (condition[ConditionFlag.InFlight] || condition[ConditionFlag.Mounted] && Control.CanFly
             && Environment.TickCount64 >= flightFallbackUntil && Vector3.Distance(from, to) >= 50);
         travelStatus = pathFlying ? "坐骑飞行寻路" : condition[ConditionFlag.Mounted] ? "坐骑地面寻路" : "步行寻路";
         pathTask = DalamudServices.PluginInterface.GetIpcSubscriber<Vector3, Vector3, bool, CancellationToken, Task<List<Vector3>>>("vnavmesh.Nav.PathfindCancelable")
@@ -1095,7 +1081,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             travelStatus = "召唤坐骑未成功，暂用地面步行";
             return true;
         }
-        if (!config.UseMount || distance < 50 || condition[ConditionFlag.InCombat] || condition[ConditionFlag.Diving]
+        if (distance < 50 || condition[ConditionFlag.InCombat] || condition[ConditionFlag.Diving]
             || Environment.TickCount64 < mountFallbackUntil) return true;
         if (condition[ConditionFlag.Casting] || condition[ConditionFlag.Mounting] || condition[ConditionFlag.Mounting71]) return false;
         // Stop first and allow a frame for movement to settle before starting a mount cast.
@@ -1105,7 +1091,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         mountReadyAt = 0;
         var actions = ActionManager.Instance();
         if (actions == null) return true;
-        uint mountAction = config.UseFlight && actions->GetActionStatus(ActionType.GeneralAction, 24) == 0 ? 24u : 9u;
+        uint mountAction = actions->GetActionStatus(ActionType.GeneralAction, 24) == 0 ? 24u : 9u;
         if (actions->GetActionStatus(ActionType.GeneralAction, mountAction) != 0
             || !actions->UseAction(ActionType.GeneralAction, mountAction))
         {
@@ -3019,7 +3005,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 
     private void DrawBookOverview()
     {
-        if (!ImGui.CollapsingHeader("九本书总览")) return;
+        if (!ImGui.CollapsingHeader("小黄书")) return;
         if (relicId == 0 || historyCharacter != DalamudServices.PlayerState.ContentId)
         { ImGui.TextWrapped("请先读取当前角色的古武书本。"); return; }
         ImGui.TextWrapped($"当前古武：{(LuminaGetter.TryGetRow<Lumina.Excel.Sheets.Item>(requiredWeapon, out var weapon) ? weapon.Name.ExtractText() : requiredWeapon.ToString())}");
@@ -3139,7 +3125,7 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
             observed = bookHistory.ContainsKey($"{relicId}:{i}")
         }).ToArray(),
         refreshLeveId, leveRefreshAttempts, refreshLeveAccepted, refreshRewardRequested,
-        useMount = config.UseMount, useFlight = config.UseFlight, pathFlying,
+        useMount = true, useFlight = true, pathFlying,
         landing, landingApproachGoal, landingSearchAt,
         lastRangeOrLos, fateIds, activeFateId, fateSlot, fatePhase, fateEngaged,
         rotationPreset, rotationActive, companionStatus, clearingFateAggressors, fateCleanupStatus,
@@ -3181,7 +3167,6 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         }
         ImGui.Spacing();
         DrawBookOverview();
-        DrawTravelSettings();
         DrawHelp();
         DrawDiagnostics();
     }
@@ -3291,13 +3276,25 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
         ImGui.Spacing();
         var columns = ImGui.GetContentRegionAvail().X >= 480 ? 4 : 2;
         if (!ImGui.BeginTable("TaskGroups", columns, ImGuiTableFlags.SizingStretchSame | ImGuiTableFlags.NoSavedSettings)) return;
-        foreach (var group in Enum.GetValues<ObjectiveGroup>())
+        var groups = Enum.GetValues<ObjectiveGroup>();
+        for (var start = 0; start < groups.Length; start += columns)
         {
-            ImGui.TableNextColumn();
-            var progress = GroupProgress(group);
-            if (ImGui.Selectable($"{GroupName(group)}  {progress.Done}/{progress.Total}##group{group}", visibleGroup == group,
-                ImGuiSelectableFlags.None, new Vector2(0, 30))) visibleGroup = group;
-            ImGui.ProgressBar((float)progress.Done / progress.Total, new Vector2(-1, 4), "");
+            ImGui.TableNextRow();
+            for (var column = 0; column < columns && start + column < groups.Length; column++)
+            {
+                ImGui.TableSetColumnIndex(column);
+                var group = groups[start + column];
+                var progress = GroupProgress(group);
+                if (ImGui.Selectable($"{GroupName(group)}  {progress.Done}/{progress.Total}##group{group}", visibleGroup == group,
+                    ImGuiSelectableFlags.None, new Vector2(0, ImGui.GetFrameHeight()))) visibleGroup = group;
+            }
+            ImGui.TableNextRow();
+            for (var column = 0; column < columns && start + column < groups.Length; column++)
+            {
+                ImGui.TableSetColumnIndex(column);
+                var progress = GroupProgress(groups[start + column]);
+                ImGui.ProgressBar((float)progress.Done / progress.Total, new Vector2(-1, 4), "");
+            }
         }
         ImGui.EndTable();
         ImGui.Spacing();
@@ -3316,21 +3313,24 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     {
         DrawSectionTitle(GroupName(visibleGroup));
         var showCompleted = config.ShowCompletedObjectives;
+        var rows = ObjectiveRows().OrderBy(x => x.Complete).Where(x => showCompleted || !x.Complete).ToArray();
+        if (rows.Length == 0) ImGui.TextWrapped("这类任务已全部完成。");
+        else if (ImGui.BeginTable("Objectives", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.NoSavedSettings))
+        {
+            ImGui.TableSetupColumn("任务", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("进度", ImGuiTableColumnFlags.WidthFixed, ImGui.CalcTextSize("未完成").X + ImGui.GetStyle().ItemSpacing.X * 2);
+            foreach (var row in rows)
+            {
+                ImGui.TableNextRow();
+                ImGui.TableNextColumn(); ImGui.TextWrapped(row.Name ?? "正在读取…");
+                ImGui.TableNextColumn();
+                ImGui.TextColored(row.Complete ? CompleteColor : ImGui.GetStyle().Colors[(int)ImGuiCol.Text], row.Progress);
+            }
+            ImGui.EndTable();
+        }
+        ImGui.Spacing();
         if (ImGui.Checkbox("显示已完成", ref showCompleted))
         { config.ShowCompletedObjectives = showCompleted; SaveSettings(); }
-        var rows = ObjectiveRows().OrderBy(x => x.Complete).Where(x => showCompleted || !x.Complete).ToArray();
-        if (rows.Length == 0) { ImGui.TextWrapped("这类任务已全部完成。"); return; }
-        if (!ImGui.BeginTable("Objectives", 2, ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.NoSavedSettings)) return;
-        ImGui.TableSetupColumn("任务", ImGuiTableColumnFlags.WidthStretch);
-        ImGui.TableSetupColumn("进度", ImGuiTableColumnFlags.WidthFixed, 80);
-        foreach (var row in rows)
-        {
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn(); ImGui.TextWrapped(row.Name ?? "正在读取…");
-            ImGui.TableNextColumn();
-            ImGui.TextColored(row.Complete ? CompleteColor : ImGui.GetStyle().Colors[(int)ImGuiCol.Text], row.Progress);
-        }
-        ImGui.EndTable();
     }
 
     private static void DrawSectionTitle(string title)
@@ -3342,9 +3342,9 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
     private void DrawHelp()
     {
         if (!ImGui.CollapsingHeader("使用说明")) return;
-        ImGui.TextWrapped("准备普通职业套装，将古武放在背包或兵装库。开始后先换职业，再单独装备古武，不会改写套装。");
-        ImGui.TextWrapped("依赖 Omni Toolbox、vnavmesh、AutoDuty 和 BossMod Reborn。FATE 前准备基萨尔野菜；当前 FATE 战斗配置只支持白魔。");
-        ImGui.TextWrapped("任务按实际机制识别，未适配的特殊交互会提示停止。BMR 只会躲避它能识别的危险区域。详细支持范围见仓库说明。");
+        ImGui.TextWrapped("vnavmesh, AutoDuty, Bossmod.");
+        ImGui.TextWrapped("插件会自动读取当前的小黄书，全自动完成，并且交付完成的小黄书，然后换新书。");
+        ImGui.TextWrapped("理符限额、诗学不够会停止运行。");
     }
 
     private void DrawDiagnostics()
@@ -3385,8 +3385,6 @@ public sealed unsafe class AnimusBookAssistant : ModuleBase
 [Serializable]
 public sealed class AnimusBookAssistantConfig
 {
-    public bool UseMount { get; set; } = true;
-    public bool UseFlight { get; set; } = true;
     public bool ShowCompletedObjectives { get; set; }
 }
 

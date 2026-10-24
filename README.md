@@ -2,17 +2,25 @@
 
 适用于 **Omni Toolbox 本地模块**的古武书本助手。读取游戏进度，自动赶路、战斗、执行副本与理符，轮巡 FATE；本卷完成后前往摩杜纳换书。
 
-**预览版 `0.1.0-preview.2`** · 作者 [Jhyxxxx1](https://github.com/Jhyxxxx1) · [问题反馈](https://github.com/Jhyxxxx1/FF14Animus/issues)
+**预览版 `0.1.0-preview.3`** · 作者 [Jhyxxxx1](https://github.com/Jhyxxxx1) · [问题反馈](https://github.com/Jhyxxxx1/FF14Animus/issues)
 
 > 当前以白魔法师为主要实测职业。不按书本卷数限制执行，但九本书的所有特殊机制尚未全部验证。
 
 ## 下载与安装
 
-1. 下载仓库中的 [AnimusBookAssistant.dll](https://github.com/Jhyxxxx1/FF14Animus/raw/refs/heads/main/AnimusBookAssistant.dll)，或下载 [完整预览包](downloads/FF14Animus-0.1.0-preview.2.zip?raw=true) 后解压到固定目录。
+1. 下载仓库中的 [AnimusBookAssistant.dll](https://github.com/Jhyxxxx1/FF14Animus/raw/refs/heads/main/AnimusBookAssistant.dll)，或下载 [完整预览包](downloads/FF14Animus-0.1.0-preview.3.zip?raw=true) 后解压到固定目录。
 2. 在 Omni Toolbox 的 **插件设置 → 本地模块** 中添加 DLL，启用“古武小黄书助手”。
 3. 更新时覆盖相同位置的 DLL，在本地模块列表中重新加载。请在脱战且任务交互结束后更新。
 
 这是 Omni 的本地模块，无需单独添加卫月插件仓库。**正常使用不需要 Dalamud MCP**。
+
+## 使用说明
+
+vnavmesh, AutoDuty, Bossmod.
+
+插件会自动读取当前的小黄书，全自动完成，并且交付完成的小黄书，然后换新书。
+
+理符限额、诗学不够会停止运行。
 
 ## 开始前
 
@@ -31,8 +39,8 @@
 ## 界面与功能
 
 - **当前任务与总进度**：显示运行阶段、当前动作和下一步。四个进度块可切换任务明细，窄窗口自动换为两列。未完成任务优先显示，已完成任务默认收起。
-- **九本书总览**：按角色和古武分别保存“已完成、进行中、曾读取、未知”。只记录实际观测到的整本完成；未知不代表未完成，也不按当前卷数推断历史。
-- **赶路设置**：优先坐骑、飞行，到目标附近再降落；实际飞行失败才回退地面。设置在重载后保留。
+- **小黄书**：按角色和古武分别保存“已完成、进行中、曾读取、未知”。只记录实际观测到的整本完成；未知不代表未完成，也不按当前卷数推断历史。
+- **自动赶路**：默认使用坐骑并优先飞行，到目标附近再降落；实际飞行失败才回退地面。
 - **更多与排错**：版本、构建编号、依赖检查、书本读取恢复、附近目标信息。
 
 ### 连续执行规则
